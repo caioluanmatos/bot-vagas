@@ -59,8 +59,8 @@ LEVER = []  # adicione empresas que usam Lever (o nome que aparece em jobs.lever
 # Termos de busca na Gupy (portal de vagas brasileiro)
 GUPY_TERMOS = ["desenvolvedor", "full stack", "frontend", "backend", "react", "node"]
 
-GUPY_URLS = ["https://employability-portal.gupy.io/api/v1/jobs",
-             "https://portal.api.gupy.io/api/v1/jobs"]
+# O endereco antigo (employability-portal.gupy.io) saiu do ar em 2026 e dava 404.
+GUPY_URL = "https://portal.gupy.io/api/job-search/jobs"
 
 # Cabecalho para as consultas (alguns sites recusam requisicoes sem identificacao)
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -153,31 +153,37 @@ def limpar_html(s: str) -> str:
 
 
 def vagas_gupy():
+    """Gupy (portal de vagas brasileiro). A API nova nao devolve mais 'country' nem
+    'isRemoteWork', entao cada termo e pesquisado duas vezes: uma pedindo so vagas
+    remotas (workplaceType=remote) e outra sem filtro, para pegar as presenciais/hibridas
+    (que depois sao filtradas pela cidade). Como e um portal brasileiro, o pais e Brasil."""
     vistos = set()
     for termo in GUPY_TERMOS:
-        try:
-            r = None
-            for base in GUPY_URLS:
-                r = requests.get(base, params={"jobName": termo, "limit": 100, "offset": 0},
-                                 headers=HEADERS, timeout=20)
-                if r.ok:
-                    break
-            if not r.ok:
-                print(f"[aviso] gupy/{termo}: resposta {r.status_code} "
-                      f"(a Gupy pode estar recusando consultas automaticas)")
-                continue
-            for j in r.json().get("data", []):
-                if j["id"] in vistos:
+        for pediu_remoto in (True, False):
+            params = {"jobName": termo, "limit": 100, "offset": 0}
+            if pediu_remoto:
+                params["workplaceType"] = "remote"
+            try:
+                r = requests.get(GUPY_URL, params=params, headers=HEADERS, timeout=20)
+                if not r.ok:
+                    print(f"[aviso] gupy/{termo}: resposta {r.status_code} "
+                          f"(a Gupy pode estar recusando consultas automaticas)")
                     continue
-                vistos.add(j["id"])
-                local = ", ".join(x for x in [j.get("city"), j.get("state"), j.get("country")] if x)
-                remoto = bool(j.get("isRemoteWork")) or j.get("workplaceType") == "remote"
-                yield dict(fonte="gupy", id=f"gupy-{j['id']}", titulo=j["name"],
-                           empresa=j.get("careerPageName") or "empresa", url=j["jobUrl"],
-                           texto=limpar_html(j.get("description")), local=local, remoto=remoto,
-                           publicada=parse_data(j.get("publishedDate")))
-        except Exception as e:
-            print(f"[aviso] gupy/{termo}: {e}")
+                for j in r.json().get("data", []):
+                    if not j.get("id") or j["id"] in vistos:
+                        continue
+                    vistos.add(j["id"])
+                    tipo = (j.get("workplaceType") or "").lower()
+                    # se a vaga informa o tipo, vale o que ela diz; se nao informa, confia no filtro
+                    remoto = tipo == "remote" or bool(j.get("isRemoteWork")) or (pediu_remoto and not tipo)
+                    local = ", ".join(x for x in [j.get("city"), j.get("state"), "Brasil"] if x)
+                    yield dict(fonte="gupy", id=f"gupy-{j['id']}", titulo=j.get("name") or "",
+                               empresa=j.get("careerPageName") or "empresa",
+                               url=j.get("jobUrl") or j.get("url") or "",
+                               texto=limpar_html(j.get("description")), local=local, remoto=remoto,
+                               publicada=parse_data(j.get("publishedDate")))
+            except Exception as e:
+                print(f"[aviso] gupy/{termo}: {e}")
 
 
 def vagas_remotive():
