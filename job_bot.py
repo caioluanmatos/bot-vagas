@@ -2,7 +2,7 @@
 Bot de vagas para desenvolvedores (Brasil).
 
 - Le seu CV (PDF ou TXT) e extrai suas habilidades
-- Busca vagas em Remotive, Greenhouse e Lever
+- Busca vagas em Gupy, Remotive, RemoteOK, We Work Remotely, Greenhouse e Lever
 - Filtra por localizacao: remoto que aceite Brasil OU presencial/hibrido na sua cidade
 - Filtra por data: so vagas publicadas nos ultimos N dias
 - Calcula o match (%) entre CV e vaga e recomenda so >= MATCH_MINIMO
@@ -26,11 +26,13 @@ import sqlite3
 import time
 import unicodedata
 import webbrowser
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
 
-MATCH_MINIMO = 75          # percentual minimo para recomendar
+MATCH_MINIMO = 70          # percentual minimo para recomendar
 CIDADE_PADRAO = "Rio de Janeiro"
 DIAS_PADRAO = 7            # so vagas publicadas nos ultimos N dias
 INTERVALO_PADRAO = 60      # minutos entre verificacoes no modo --loop
@@ -66,7 +68,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
            "Accept": "application/json"}
 
 # Fontes que o bot considera confiaveis
-FONTES_CONFIAVEIS = {"gupy", "remotive", "greenhouse", "lever"}
+FONTES_CONFIAVEIS = {"gupy", "remotive", "remoteok", "weworkremotely", "greenhouse", "lever"}
 
 # Filtro de titulo (aplicado ao titulo sem acentos e em minusculas)
 TITULO_DEV = re.compile(
@@ -226,6 +228,60 @@ def vagas_lever():
             print(f"[aviso] lever/{empresa}: {e}")
 
 
+def vagas_remoteok():
+    """RemoteOK: API aberta, sem chave. O primeiro item da lista e um aviso legal."""
+    r = requests.get("https://remoteok.com/api", headers=HEADERS, timeout=30)
+    for j in r.json():
+        if not isinstance(j, dict) or not j.get("id") or not j.get("position"):
+            continue
+        tags = " ".join(j.get("tags") or [])
+        yield dict(fonte="remoteok", id=f"remoteok-{j['id']}", titulo=j["position"],
+                   empresa=j.get("company") or "empresa",
+                   url=j.get("url") or j.get("apply_url") or "",
+                   texto=f"{limpar_html(j.get('description'))} {tags}",
+                   local=j.get("location") or "", remoto=True,
+                   publicada=parse_data(j.get("date")))
+
+
+def vagas_weworkremotely():
+    """We Work Remotely: feed RSS publico. O titulo vem como 'Empresa: Cargo'."""
+    r = requests.get("https://weworkremotely.com/remote-jobs.rss", headers=HEADERS, timeout=30)
+    for item in ET.fromstring(r.content).iter("item"):
+        completo = (item.findtext("title") or "").strip()
+        empresa, _, titulo = completo.partition(": ")
+        if not titulo:
+            empresa, titulo = "empresa", completo
+        link = (item.findtext("link") or "").strip()
+        publicada = None
+        try:
+            publicada = parsedate_to_datetime(item.findtext("pubDate"))
+            if publicada.tzinfo is None:
+                publicada = publicada.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            pass
+        texto = f"{limpar_html(item.findtext('description'))} {item.findtext('skills') or ''}"
+        yield dict(fonte="weworkremotely", id=f"wwr-{(item.findtext('guid') or link).strip()}",
+                   titulo=titulo, empresa=empresa, url=link, texto=texto,
+                   local=(item.findtext("region") or ""), remoto=True, publicada=publicada)
+
+
+_ultima_consulta = {}
+
+
+def liberado(fonte: str, cada_horas: int) -> bool:
+    """Limita a frequencia de fontes que pedem poucas consultas por dia.
+    No GitHub Actions agendado so consulta nas horas (UTC) multiplas de `cada_horas`;
+    fora dele, respeita o intervalo desde a ultima consulta."""
+    if os.environ.get("GITHUB_EVENT_NAME") == "schedule":
+        return datetime.now(timezone.utc).hour % cada_horas == 0
+    agora = time.time()
+    ultima = _ultima_consulta.get(fonte)
+    if ultima and agora - ultima < cada_horas * 3600:
+        return False
+    _ultima_consulta[fonte] = agora
+    return True
+
+
 # ---------- Localizacao ----------
 def local_compativel(vaga: dict, cidade: str) -> bool:
     """Remoto: precisa aceitar Brasil. Presencial/hibrido: precisa ser na sua cidade."""
@@ -297,7 +353,8 @@ def ler_telegram():
     return token, chat_id
 
 
-def enviar_telegram(token: str, chat_id: str, texto: str, url: str | None = None):
+def enviar_telegram(token: str, chat_id: str, texto: str, url: str | None = None) -> bool:
+    """Devolve True se o Telegram aceitou a mensagem."""
     dados = {"chat_id": chat_id, "text": texto[:4000], "disable_web_page_preview": "true"}
     if url:
         dados["reply_markup"] = json.dumps(
@@ -307,8 +364,11 @@ def enviar_telegram(token: str, chat_id: str, texto: str, url: str | None = None
                           data=dados, timeout=20)
         if not r.ok:
             print(f"[aviso] telegram: {r.status_code} {r.text[:150]}")
+            return False
+        return True
     except Exception as e:
         print(f"[aviso] telegram: {e}")
+        return False
 
 
 def descobrir_chat():
@@ -342,32 +402,67 @@ def abrir_banco():
 
 
 # ---------- Um ciclo de busca ----------
+# Fontes e de quantas em quantas horas cada uma pode ser consultada (0 = sempre).
+# O Remotive pede poucas consultas por dia (cerca de 4), por isso 6 horas.
+FONTES = [
+    (vagas_gupy, 0),
+    (vagas_remotive, 6),
+    (vagas_remoteok, 3),
+    (vagas_weworkremotely, 0),
+    (vagas_greenhouse, 0),
+    (vagas_lever, 0),
+]
+
+
 def executar_ciclo(args, skills_cv, tg_token, tg_chat):
     db = abrir_banco()
     achadas = 0
     enviados = 0
     limite_data = datetime.now(timezone.utc) - timedelta(days=args.dias)
-    for fonte in (vagas_remotive, vagas_greenhouse, vagas_lever):
+    for fonte, cada_horas in FONTES:
+        nome = fonte.__name__.replace("vagas_", "")
+        if cada_horas and not liberado(nome, cada_horas):
+            print(f"[{nome}] pulada neste ciclo (consulta a cada {cada_horas}h)")
+            continue
+        c = dict(lidas=0, dev=0, recentes=0, local=0, novas=0, match=0)
         try:
             for vaga in fonte():
+                c["lidas"] += 1
                 titulo = sem_acento(vaga["titulo"])
                 if not TITULO_DEV.search(titulo):
                     continue
                 if not args.senior and TITULO_EXCLUI.search(titulo):
                     continue
+                c["dev"] += 1
                 if vaga["publicada"] and vaga["publicada"] < limite_data:
                     continue
+                c["recentes"] += 1
                 if not local_compativel(vaga, args.cidade):
                     continue
+                c["local"] += 1
                 if db.execute("SELECT 1 FROM vistas WHERE id=?", (vaga["id"],)).fetchone():
                     continue
+                c["novas"] += 1
                 pct, em_comum = calcular_match(skills_cv, vaga)
                 if pct < args.minimo:
                     continue
+                c["match"] += 1
                 v, motivos = veredito(vaga)
                 enviar = bool(tg_token) and v != "SUSPEITA"
                 if enviar and enviados >= MAX_ENVIOS_POR_CICLO:
                     continue  # fica para a proxima verificacao
+                if enviar:
+                    selo = "✅ CONFIAVEL" if v == "CONFIAVEL" else "⚠️ CUIDADO: " + "; ".join(motivos)
+                    ok = enviar_telegram(tg_token, tg_chat, (
+                        f"\U0001F4BC {vaga['titulo']}\n"
+                        f"\U0001F3E2 {vaga['empresa']}\n"
+                        f"\U0001F4CD {descricao_local(vaga)}\n"
+                        f"\U0001F552 {idade_vaga(vaga)}\n"
+                        f"\U0001F3AF Match: {pct}% ({', '.join(sorted(em_comum))})\n"
+                        f"{selo}"), url=vaga["url"])
+                    if not ok:
+                        continue  # nao marca como vista: tenta de novo no proximo ciclo
+                    enviados += 1
                 db.execute("INSERT INTO vistas VALUES (?)", (vaga["id"],))
                 achadas += 1
                 print(f"[{pct}%] {vaga['titulo']} - {vaga['empresa']}")
@@ -380,19 +475,12 @@ def executar_ciclo(args, skills_cv, tg_token, tg_chat):
                     if args.abrir:
                         webbrowser.open(vaga["url"])
                 print()
-                if enviar:
-                    selo = "\u2705 CONFIAVEL" if v == "CONFIAVEL" else "\u26a0\ufe0f CUIDADO: " + "; ".join(motivos)
-                    enviar_telegram(tg_token, tg_chat, (
-                        f"\U0001F4BC {vaga['titulo']}\n"
-                        f"\U0001F3E2 {vaga['empresa']}\n"
-                        f"\U0001F4CD {descricao_local(vaga)}\n"
-                        f"\U0001F552 {idade_vaga(vaga)}\n"
-                        f"\U0001F3AF Match: {pct}% ({', '.join(sorted(em_comum))})\n"
-                        f"{selo}"), url=vaga["url"])
-                    enviados += 1
         except Exception as e:
             print(f"[aviso] {fonte.__name__}: {e}")
         db.commit()
+        # resumo do funil: mostra em que etapa as vagas de cada fonte ficam pelo caminho
+        print(f"[{nome}] lidas {c['lidas']} | dev {c['dev']} | recentes {c['recentes']} | "
+              f"local ok {c['local']} | ainda nao vistas {c['novas']} | match ok {c['match']}")
     db.commit()
     db.close()
     print(f"{achadas} vaga(s) nova(s) com match >= {args.minimo}%.")
